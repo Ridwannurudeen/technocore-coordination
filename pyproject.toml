@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "technocore-coordination"
+version = "0.1.0"
+description = "Signed-lane coordination CLI for Technocore"
+requires-python = ">=3.12"
+dependencies = ["cryptography"]
+
+[project.scripts]
+tc = "technocore.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["technocore*"]

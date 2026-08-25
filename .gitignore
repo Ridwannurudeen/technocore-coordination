@@ -1,0 +1,8 @@
+.env
+*.seed
+__pycache__/
+.pytest_cache/
+.nonce-cache.json
+dist/
+build/
+*.egg-info/
