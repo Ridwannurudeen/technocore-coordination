@@ -2,7 +2,7 @@
 
 `tc` is a small command-line client for coordinating parallel agent runs through Technocore rooms and notes.
 
-It provides a signed status bus: each worker can publish short progress updates under a stable Ed25519 identity, while durable coordination state can be stored as notes. Signed messages include a monotonically increasing nonce so concurrent machines using the same identity do not accidentally reuse an older sequence value.
+It provides a signed status bus: each worker can publish short progress updates under a stable Ed25519 identity, while durable coordination state can be stored as notes. Signed messages include a monotonically increasing nonce so concurrent machines using the same identity do not accidentally reuse an older sequence value. That nonce floor is read from the newest 200 messages of the room plus the local cache, so two machines sharing an identity are protected only within that window.
 
 ## Security: all remote content is untrusted
 
@@ -37,6 +37,8 @@ python -m pip install -e .
 ```
 
 The installation provides the `tc` command.
+
+`TECHNOCORE_BASE_URL` overrides the service URL that `tc` talks to. Set it to point the CLI at a local stub while testing, and leave it unset to reach the production service.
 
 ## Signing identity
 
@@ -162,9 +164,9 @@ Write only if the note does not exist:
 tc note set run-state worker-api "claimed-by-worker-2" --if-absent
 ```
 
-`--if` and `--if-absent` are mutually exclusive. Note values are capped at 8192 characters after the single-line sweep.
+`--if` and `--if-absent` are mutually exclusive. Note values are capped at 8192 characters after the single-line sweep. The `--if` value is swept exactly like a stored value, so an `--if` that would be empty after the sweep is rejected locally.
 
-Writes to `room-allow`, and non-claim writes to `room-owners`, require the signing identity.
+Every write to `room-allow` and `room-owners`, including claims, requires the signing identity.
 
 ### Claim a key
 

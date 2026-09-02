@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
+import unicodedata
 from typing import Any, Sequence
 
 from .client import (
+    DEFAULT_BASE_URL,
+    SIGNED_NOTE_NAMESPACES,
     Client,
     ClientError,
     ConflictError,
@@ -17,7 +22,9 @@ from .client import (
     ValidationError,
     room_messages,
 )
-from .signing import Identity, SeedError, SigningError
+from .signing import INVISIBLE_CATEGORIES, Identity, SeedError, SigningError
+
+WATCH_IDLE_SECONDS = 1.0
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -81,27 +88,31 @@ def _print_untrusted_text(value: str) -> None:
         print("UNTRUSTED\t")
         return
     for line in lines:
-        print(f"UNTRUSTED\t{line}")
+        visible = "".join(
+            " " if unicodedata.category(char) in INVISIBLE_CATEGORIES else char
+            for char in line
+        )
+        print(f"UNTRUSTED\t{visible}")
 
 
 def _print_untrusted_json(value: Any) -> None:
+    dumped = json.dumps(
+        {"untrusted": True, "data": value},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     print(
-        json.dumps(
-            {"untrusted": True, "data": value},
-            ensure_ascii=False,
-            separators=(",", ":"),
+        "".join(
+            json.dumps(char, ensure_ascii=True)[1:-1]
+            if unicodedata.category(char) in INVISIBLE_CATEGORIES
+            else char
+            for char in dumped
         )
     )
 
 
-def _identity_for_note(
-    namespace: str,
-    *,
-    if_absent: bool,
-) -> Identity | None:
-    if namespace == "room-allow":
-        return Identity.load()
-    if namespace == "room-owners" and not if_absent:
+def _identity_for_note(namespace: str) -> Identity | None:
+    if namespace in SIGNED_NOTE_NAMESPACES:
         return Identity.load()
     return None
 
@@ -121,6 +132,7 @@ def _watch(client: Client, room: str, since: int | None) -> int:
         messages = room_messages(payload)
         if not messages:
             poll_counter += 1
+            time.sleep(WATCH_IDLE_SECONDS)
             continue
 
         next_cursor = cursor
@@ -144,7 +156,7 @@ def _run(args: argparse.Namespace) -> int:
         print(f"fingerprint: {identity.fingerprint}")
         return 0
 
-    client = Client()
+    client = Client(base_url=os.environ.get("TECHNOCORE_BASE_URL", DEFAULT_BASE_URL))
 
     if args.command == "read":
         if args.as_json:
@@ -175,10 +187,7 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "watch":
-        try:
-            return _watch(client, args.room, args.since)
-        except KeyboardInterrupt:
-            return 0
+        return _watch(client, args.room, args.since)
 
     if args.command == "note":
         if args.note_command == "get":
@@ -186,10 +195,7 @@ def _run(args: argparse.Namespace) -> int:
             _print_untrusted_text(value)
             return 0
 
-        identity = _identity_for_note(
-            args.namespace,
-            if_absent=args.if_absent,
-        )
+        identity = _identity_for_note(args.namespace)
         response = client.note_set(
             args.namespace,
             args.key,
@@ -202,16 +208,14 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "claim":
-        identity = _identity_for_note(
-            args.namespace,
-            if_absent=True,
-        )
-        client.claim(
+        identity = _identity_for_note(args.namespace)
+        response = client.claim(
             args.namespace,
             args.key,
             args.worker_id,
             identity=identity,
         )
+        _print_untrusted_text(response)
         print(
             f"claimed {args.namespace}/{args.key} as {args.worker_id}; "
             "claim ordering does not fence ownership"
@@ -253,6 +257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return _run(args)
+    except KeyboardInterrupt:
+        return 130
     except (ClientError, SigningError) as exc:
         print(f"tc: error: {exc}", file=sys.stderr)
         return _exit_code(exc)

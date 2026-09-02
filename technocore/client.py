@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -27,6 +28,31 @@ ASCII_NONCE_RE = re.compile(r"[0-9]{1,19}\Z")
 MAX_SAFE_MILLISECOND_NONCE = 9_999_999_999_999
 SIGNED_NOTE_NAMESPACES = frozenset({"room-owners", "room-allow"})
 MAX_GET_URL_LENGTH = 16_000
+REQUEST_TIMEOUT_SECONDS = 30.0
+MAX_RETRY_SECONDS = 60.0
+MAX_RESPONSE_BYTES = 8_388_608
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse 3xx: following one would hand the signed URL to another host."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def _open(request: urllib.request.Request, timeout: float) -> Any:
+    return _OPENER.open(request, timeout=timeout)
 
 
 class ClientError(Exception):
@@ -140,21 +166,21 @@ class Client:
         body: str,
         retry_after_header: str | None,
     ) -> float | None:
+        if retry_after_header is not None:
+            try:
+                seconds = float(retry_after_header)
+            except ValueError:
+                seconds = None
+            if seconds is not None and seconds >= 0:
+                return min(seconds, MAX_RETRY_SECONDS)
+
         match = re.search(
             r"(?i)(?:retry(?:-after)?|try\s+again|wait)"
             r"(?:\s+in)?[^0-9]{0,32}([0-9]+(?:\.[0-9]+)?)",
             body,
         )
         if match:
-            return float(match.group(1))
-
-        if retry_after_header is not None:
-            try:
-                seconds = float(retry_after_header)
-            except ValueError:
-                return None
-            if seconds >= 0:
-                return seconds
+            return min(float(match.group(1)), MAX_RETRY_SECONDS)
         return None
 
     def _request(
@@ -163,6 +189,7 @@ class Client:
         *,
         query: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> str:
         url = self.base_url + path
         if query:
@@ -188,10 +215,11 @@ class Client:
                 method=method,
             )
             try:
-                with urllib.request.urlopen(request) as response:
-                    raw = response.read()
+                with _open(request, timeout=timeout) as response:
+                    raw = response.read(MAX_RESPONSE_BYTES + 1)
+                    remaining = response.length
             except urllib.error.HTTPError as exc:
-                raw_error = exc.read()
+                raw_error = exc.read(MAX_RESPONSE_BYTES)
                 body = raw_error.decode("utf-8", errors="replace")
                 if exc.code == 409:
                     raise ConflictError(exc.code, body) from None
@@ -216,6 +244,15 @@ class Client:
                 raise NetworkError(
                     f"network request failed ({type(exc).__name__})"
                 ) from None
+            except http.client.HTTPException as exc:
+                raise ProtocolError(
+                    f"service response is malformed ({type(exc).__name__})"
+                ) from None
+
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise ProtocolError("service response exceeds the 8 MiB cap")
+            if remaining:
+                raise ProtocolError("service response was truncated")
 
             try:
                 return raw.decode("utf-8")
@@ -229,8 +266,9 @@ class Client:
         path: str,
         *,
         query: dict[str, str] | None = None,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> Any:
-        body = self._request(path, query=query)
+        body = self._request(path, query=query, timeout=timeout)
         try:
             return json.loads(body)
         except json.JSONDecodeError:
@@ -253,7 +291,11 @@ class Client:
             poll_counter=poll_counter,
             json_format=False,
         )
-        return self._request(f"/r/{self._segment(room)}", query=query)
+        return self._request(
+            f"/r/{self._segment(room)}",
+            query=query,
+            timeout=REQUEST_TIMEOUT_SECONDS + (wait or 0),
+        )
 
     def read_room_json(
         self,
@@ -272,7 +314,11 @@ class Client:
             poll_counter=poll_counter,
             json_format=True,
         )
-        return self._request_json(f"/r/{self._segment(room)}", query=query)
+        return self._request_json(
+            f"/r/{self._segment(room)}",
+            query=query,
+            timeout=REQUEST_TIMEOUT_SECONDS + (wait or 0),
+        )
 
     def _room_query(
         self,
@@ -310,6 +356,8 @@ class Client:
             if message.get("from") != did:
                 continue
             nonce = message.get("nonce")
+            if nonce is None:
+                continue
             if isinstance(nonce, bool):
                 raise NonceResolutionError(
                     "an existing message from this DID has a malformed nonce"
@@ -367,21 +415,19 @@ class Client:
                 f"{nonce_text}/{self._segment(signed_text)}"
             )
 
-            if len(self.base_url + path) <= MAX_GET_URL_LENGTH:
-                response = self._request(path)
-            else:
-                response = self._request(
-                    f"/r/{self._segment(room)}",
-                    json_body={
-                        "did": identity.did,
-                        "sig": encoded_signature,
-                        "nonce": nonce_text,
-                        "text": signed_text,
-                    },
-                )
-
             self._store_nonce(identity.did, scope, nonce)
-            return response
+
+            if len(self.base_url + path) <= MAX_GET_URL_LENGTH:
+                return self._request(path)
+            return self._request(
+                f"/r/{self._segment(room)}",
+                json_body={
+                    "did": identity.did,
+                    "sig": encoded_signature,
+                    "nonce": nonce_text,
+                    "text": signed_text,
+                },
+            )
 
     def note_get(self, namespace: str, key: str) -> str:
         validate_name("namespace", namespace)
@@ -406,6 +452,8 @@ class Client:
             raise ValidationError("expected and if_absent are mutually exclusive")
 
         cleaned = self._clean(value, MAX_VALUE_CHARS)
+        if expected is not None:
+            expected = self._clean(expected, MAX_VALUE_CHARS)
 
         signed = namespace in SIGNED_NOTE_NAMESPACES
         if signed:
@@ -473,9 +521,29 @@ class Client:
                 f"{self._segment(encoded_signature)}/{nonce_text}/"
                 f"{self._segment(signed_value)}"
             )
-            response = self._request(path, query=query)
+            full_url = self.base_url + path
+            if query:
+                full_url += "?" + urllib.parse.urlencode(query)
+
             self._store_nonce(identity.did, scope, nonce)
-            return response
+
+            if len(full_url) <= MAX_GET_URL_LENGTH:
+                return self._request(path, query=query)
+
+            body: dict[str, Any] = {
+                "did": identity.did,
+                "sig": encoded_signature,
+                "nonce": nonce_text,
+                "value": signed_value,
+            }
+            if expected is not None:
+                body["if"] = expected
+            elif if_absent:
+                body["if_absent"] = True
+            return self._request(
+                f"/kv/{self._segment(namespace)}/{self._segment(key)}",
+                json_body=body,
+            )
 
     def _room_note_nonce(self, room: str) -> int:
         try:
@@ -558,11 +626,14 @@ class Client:
             payload = json.loads(raw)
         except (OSError, json.JSONDecodeError) as exc:
             raise NonceResolutionError(
-                "the local nonce cache is unreadable or malformed"
+                f"the local nonce cache {self.nonce_cache_path} is unreadable "
+                "or malformed"
             ) from exc
 
         if not isinstance(payload, dict):
-            raise NonceResolutionError("the local nonce cache is malformed")
+            raise NonceResolutionError(
+                f"the local nonce cache {self.nonce_cache_path} is malformed"
+            )
 
         cache: dict[str, int] = {}
         for key, value in payload.items():
@@ -573,7 +644,9 @@ class Client:
                 or value < 0
                 or value > MAX_SAFE_MILLISECOND_NONCE
             ):
-                raise NonceResolutionError("the local nonce cache is malformed")
+                raise NonceResolutionError(
+                    f"the local nonce cache {self.nonce_cache_path} is malformed"
+                )
             cache[key] = value
         return cache
 
@@ -608,7 +681,7 @@ class Client:
                 except OSError:
                     pass
             raise NonceResolutionError(
-                "could not persist the local nonce cache"
+                f"could not persist the local nonce cache {self.nonce_cache_path}"
             ) from exc
 
     @contextmanager
@@ -622,20 +695,25 @@ class Client:
             ) from exc
 
         try:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
+            try:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
 
-            if os.name == "nt":
-                import msvcrt
+                if os.name == "nt":
+                    import msvcrt
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                raise NonceResolutionError(
+                    "could not acquire the local nonce lock"
+                ) from exc
 
             try:
                 yield
@@ -649,10 +727,6 @@ class Client:
                     import fcntl
 
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError as exc:
-            raise NonceResolutionError(
-                "could not acquire the local nonce lock"
-            ) from exc
         finally:
             handle.close()
 
