@@ -1,6 +1,10 @@
+import http.client
+import http.server
 import io
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.parse
 from pathlib import Path
@@ -9,13 +13,15 @@ from unittest.mock import patch
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from technocore import cli
 from technocore import client as client_module
 from technocore.client import (
-    MAX_SAFE_MILLISECOND_NONCE,
     Client,
     ConflictError,
+    HTTPStatusError,
     NetworkError,
     NonceResolutionError,
+    ProtocolError,
     ValidationError,
     validate_name,
 )
@@ -40,14 +46,15 @@ class StubClient(Client):
             raise self.room_payload
         return self.room_payload
 
-    def _request(self, path, *, query=None, json_body=None):
+    def _request(self, path, *, query=None, json_body=None, timeout=None):
         self.requests.append((path, query, json_body))
         return "ok"
 
 
 class FakeResponse:
-    def __init__(self, body: bytes):
+    def __init__(self, body: bytes, length=0):
         self.body = body
+        self.length = length
 
     def __enter__(self):
         return self
@@ -55,8 +62,8 @@ class FakeResponse:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
-    def read(self):
-        return self.body
+    def read(self, size=-1):
+        return self.body if size < 0 else self.body[:size]
 
 
 def identity():
@@ -106,25 +113,51 @@ def test_local_cache_beats_backward_clock(tmp_path, monkeypatch):
     assert posted_nonce(client) == 8001
 
 
-def test_nonce_above_safe_millisecond_range_is_refused(tmp_path):
+def test_hostile_remote_nonce_cannot_block_signed_write(tmp_path, monkeypatch):
     signer = identity()
-    client = StubClient(
-        tmp_path / "nonces.json",
-        [
-            {
-                "from": signer.did,
-                "nonce": str(MAX_SAFE_MILLISECOND_NONCE + 1),
-            }
-        ],
-    )
+    hostile_nonce = 9_999_999_999_999
+    current_ms = 1_700_000_000_000
+    requested = []
 
-    with pytest.raises(
-        NonceResolutionError,
-        match="above the safe millisecond range",
-    ):
-        client.say_signed("lobby", "ready", signer)
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested.append(self.path)
+            if self.path.startswith("/r/lobby?"):
+                body = json.dumps(
+                    [{"from": signer.did, "nonce": hostile_nonce}]
+                ).encode("utf-8")
+            else:
+                body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    assert client.requests == []
+        def log_message(self, format, *args):
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(client_module.time, "time", lambda: current_ms / 1000)
+        cache_path = tmp_path / "nonces.json"
+        client = Client(
+            f"http://127.0.0.1:{server.server_port}",
+            nonce_cache_path=cache_path,
+        )
+
+        assert client.say_signed("lobby", "ready", signer) == "ok"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    signed_path = urllib.parse.urlparse(requested[-1]).path
+    written_nonce = int(signed_path.split("/")[-2])
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert written_nonce == current_ms
+    assert cache[f"{signer.did}|room:lobby"] == current_ms
 
 
 def test_unreadable_room_refuses_write(tmp_path):
@@ -205,10 +238,10 @@ def test_conflict_surfaces_current_value(tmp_path, monkeypatch):
         io.BytesIO(b"current-worker"),
     )
 
-    def raise_conflict(request):
+    def raise_conflict(request, timeout):
         raise error
 
-    monkeypatch.setattr(client_module.urllib.request, "urlopen", raise_conflict)
+    monkeypatch.setattr(client_module, "_open", raise_conflict)
     client = Client(
         "https://example.invalid",
         nonce_cache_path=tmp_path / "nonces.json",
@@ -244,11 +277,11 @@ def test_if_absent_uses_cas_query(tmp_path):
     assert body is None
 
 
-def test_rate_limit_seconds_are_parsed_from_body(tmp_path, monkeypatch):
+def test_rate_limit_prefers_the_retry_after_header(tmp_path, monkeypatch):
     calls = 0
     sleeps = []
 
-    def urlopen(request):
+    def fake_open(request, timeout):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -256,12 +289,12 @@ def test_rate_limit_seconds_are_parsed_from_body(tmp_path, monkeypatch):
                 request.full_url,
                 429,
                 "Too Many Requests",
-                {"Retry-After": "99"},
-                io.BytesIO(b"rate limited; retry after 1.25 seconds"),
+                {"Retry-After": "1.25"},
+                io.BytesIO(b"rate limited; retry after 99 seconds"),
             )
         return FakeResponse(b"ok")
 
-    monkeypatch.setattr(client_module.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(client_module, "_open", fake_open)
     monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
     client = Client(
         "https://example.invalid",
@@ -271,6 +304,34 @@ def test_rate_limit_seconds_are_parsed_from_body(tmp_path, monkeypatch):
     assert client.note_get("status", "worker") == "ok"
     assert sleeps == [1.25]
     assert calls == 2
+
+
+def test_rate_limit_body_seconds_are_capped(tmp_path, monkeypatch):
+    calls = 0
+    sleeps = []
+
+    def fake_open(request, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                429,
+                "Too Many Requests",
+                {},
+                io.BytesIO(b"rate limited; retry after 100000 seconds"),
+            )
+        return FakeResponse(b"ok")
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    assert client.note_get("status", "worker") == "ok"
+    assert sleeps == [60.0]
 
 
 def test_seed_never_appears_in_exceptions_logs_or_urls(
@@ -361,3 +422,393 @@ def test_room_owners_if_absent_write_requires_identity(tmp_path):
             )
 
     request.assert_not_called()
+
+
+def test_long_poll_timeout_covers_the_wait_window(tmp_path, monkeypatch):
+    timeouts = []
+
+    def fake_open(request, timeout):
+        timeouts.append(timeout)
+        return FakeResponse(b"ok")
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    client.read_room("lobby", since=0, wait=10)
+    client.note_get("status", "worker")
+
+    assert timeouts == [40.0, 30.0]
+
+
+def test_socket_timeout_becomes_a_network_error(tmp_path, monkeypatch):
+    def fake_open(request, timeout):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    with pytest.raises(NetworkError, match="TimeoutError"):
+        client.note_get("status", "worker")
+
+
+def test_total_deadline_stops_a_trickling_response(tmp_path):
+    body = b"0123456789"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                for byte in body:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, format, *args):
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = Client(
+            f"http://127.0.0.1:{server.server_port}",
+            nonce_cache_path=tmp_path / "nonces.json",
+        )
+        started = time.monotonic()
+        with pytest.raises(NetworkError, match="TimeoutError"):
+            client._request("/trickle", timeout=0.2)
+        assert time.monotonic() - started < 0.4
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_deeply_nested_json_becomes_a_protocol_error(tmp_path, monkeypatch):
+    body = ("[" * 100_000 + "0" + "]" * 100_000).encode("ascii")
+
+    def fake_open(request, timeout):
+        return FakeResponse(body)
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    with pytest.raises(ProtocolError, match="not valid JSON"):
+        client.read_room_json("lobby")
+
+
+def test_redirects_are_not_followed_by_the_real_opener(tmp_path):
+    requested = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested.append(self.path)
+            if self.path == "/kv/status/worker":
+                self.send_response(302)
+                self.send_header("Location", "/kv/status/worker/followed")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b"followed"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = Client(
+            f"http://127.0.0.1:{server.server_port}",
+            nonce_cache_path=tmp_path / "nonces.json",
+        )
+        with pytest.raises(HTTPStatusError) as raised:
+            client.note_get("status", "worker")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert raised.value.status == 302
+    assert requested == ["/kv/status/worker"]
+
+
+def test_unsigned_messages_without_a_nonce_do_not_block_the_floor(tmp_path):
+    signer = identity()
+    client = StubClient(tmp_path / "nonces.json")
+
+    highest = client._highest_room_nonce(
+        [
+            {"from": signer.did, "text": "posted through the nick route"},
+            {"from": signer.did, "nonce": 5},
+        ],
+        signer.did,
+    )
+
+    assert highest == 5
+
+
+def test_oversized_response_is_refused(tmp_path, monkeypatch):
+    def fake_open(request, timeout):
+        return FakeResponse(b"x" * (client_module.MAX_RESPONSE_BYTES + 1))
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    with pytest.raises(ProtocolError, match="8 MiB cap"):
+        client.note_get("status", "worker")
+
+
+def test_long_signed_note_falls_back_to_a_post(tmp_path, monkeypatch):
+    signer = identity()
+    requests = []
+
+    def fake_open(request, timeout):
+        requests.append(request)
+        return FakeResponse(b"0" if len(requests) == 1 else b"ok")
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+    value = "\u754c" * 8192
+
+    assert (
+        client.note_set(
+            "room-owners",
+            "d-test-room",
+            value,
+            identity=signer,
+        )
+        == "ok"
+    )
+
+    written = requests[-1]
+    path = urllib.parse.urlparse(written.full_url).path
+    assert written.get_method() == "POST"
+    assert path == "/kv/room-owners/d-test-room"
+    assert "/set-signed/" not in path
+
+    body = json.loads(written.data.decode("utf-8"))
+    assert body["did"] == signer.did
+    assert len(body["sig"]) == 86
+    assert body["nonce"].isdigit()
+    assert body["value"] == value
+
+
+def test_expected_value_is_swept_like_the_stored_value(tmp_path):
+    client = StubClient(tmp_path / "nonces.json")
+
+    client.note_set("status", "worker", "reviewed", expected="a\nb")
+
+    _, query, _ = client.requests[-1]
+    assert query == {"if": "a b"}
+
+
+def test_caller_oserror_is_not_relabelled_as_a_lock_failure(tmp_path):
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    with pytest.raises(OSError) as raised:
+        with client._nonce_lock():
+            raise OSError(28, "No space left on device")
+
+    assert raised.value.errno == 28
+
+
+def test_nonce_is_stored_even_when_the_response_is_lost(tmp_path):
+    signer = identity()
+    cache_path = tmp_path / "nonces.json"
+    client = StubClient(cache_path)
+
+    with patch.object(
+        client,
+        "_request",
+        side_effect=HTTPStatusError(500, "boom"),
+    ):
+        with pytest.raises(HTTPStatusError):
+            client.say_signed("lobby", "ready", signer)
+
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert cache[f"{signer.did}|room:lobby"] > 0
+
+
+def test_malformed_nonce_cache_names_the_file(tmp_path):
+    cache_path = tmp_path / "nonces.json"
+    cache_path.write_text("{", encoding="utf-8")
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=cache_path,
+    )
+
+    with pytest.raises(NonceResolutionError) as raised:
+        client._load_nonce("did:key:test", "room:lobby")
+
+    assert str(cache_path) in str(raised.value)
+
+
+def test_terminal_escapes_cannot_erase_the_untrusted_label(capsys):
+    cli._print_untrusted_text("\x1b[2K\x1b[1Gspoofed")
+
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert out.startswith("UNTRUSTED\t")
+    assert "spoofed" in out
+
+
+def test_http_error_controls_are_escaped_on_stderr(monkeypatch, capsys):
+    body = "\x1b[2K\x9b2Kspoofed".encode("utf-8")
+
+    def fake_open(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            500,
+            "Internal Server Error",
+            {},
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    monkeypatch.setenv("TECHNOCORE_BASE_URL", "https://example.invalid")
+
+    assert cli.main(["note", "get", "status", "worker"]) == 7
+
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "\x9b" not in err
+    assert "[UNTRUSTED service data]" in err
+    assert "\\u001b[2K\\u009b2Kspoofed" in err
+
+
+def test_claim_on_room_owners_signs_and_prints_the_response(capsys):
+    signer = object()
+
+    with patch.object(cli.Identity, "load", return_value=signer):
+        with patch.object(cli.Client, "note_set", return_value="ok") as note_set:
+            assert cli.main(["claim", "room-owners", "d-x", "worker-2"]) == 0
+
+    note_set.assert_called_once_with(
+        "room-owners",
+        "d-x",
+        "worker-2",
+        if_absent=True,
+        identity=signer,
+    )
+    assert "UNTRUSTED\tok" in capsys.readouterr().out
+
+
+def test_idle_watch_poll_sleeps(monkeypatch):
+    class Stop(Exception):
+        pass
+
+    class IdleClient:
+        def __init__(self):
+            self.polls = 0
+
+        def read_room_json(self, room, **kwargs):
+            self.polls += 1
+            if self.polls == 1:
+                return {"messages": []}
+            raise Stop
+
+    sleeps = []
+    monkeypatch.setattr(cli.time, "sleep", sleeps.append)
+
+    with pytest.raises(Stop):
+        cli._watch(IdleClient(), "lobby", None)
+
+    assert sleeps == [1.0]
+
+
+def test_base_url_is_overridable_for_testing(monkeypatch):
+    monkeypatch.setenv("TECHNOCORE_BASE_URL", "http://127.0.0.1:8931")
+
+    with patch.object(cli, "Client") as client_class:
+        client_class.return_value.read_room.return_value = ""
+        assert cli.main(["read", "lobby"]) == 0
+
+    client_class.assert_called_once_with(base_url="http://127.0.0.1:8931")
+
+
+def test_keyboard_interrupt_exits_130():
+    with patch.object(cli, "_run", side_effect=KeyboardInterrupt):
+        assert cli.main(["read", "lobby"]) == 130
+
+
+def test_truncated_response_is_refused(tmp_path, monkeypatch):
+    def fake_open(request, timeout):
+        return FakeResponse(b"partial", length=12)
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    with pytest.raises(ProtocolError, match="truncated"):
+        client.note_get("status", "worker")
+
+
+def test_incomplete_read_becomes_a_protocol_error(tmp_path, monkeypatch):
+    def fake_open(request, timeout):
+        raise http.client.IncompleteRead(b"partial", 12)
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    with pytest.raises(ProtocolError, match="IncompleteRead"):
+        client.note_get("status", "worker")
+
+
+def test_unpersistable_nonce_cache_names_the_file(tmp_path, monkeypatch):
+    def replace(source, target):
+        raise OSError("read-only file system")
+
+    cache_path = tmp_path / "nonces.json"
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=cache_path,
+    )
+    monkeypatch.setattr(client_module.os, "replace", replace)
+
+    with pytest.raises(NonceResolutionError) as raised:
+        client._store_nonce("did:key:test", "room:lobby", 1)
+
+    assert str(cache_path) in str(raised.value)
+
+
+def test_terminal_escapes_are_escaped_in_untrusted_json(capsys):
+    text = "\x9b2K\u2028spoofed"
+
+    cli._print_untrusted_json({"text": text})
+
+    out = capsys.readouterr().out
+    assert "\x9b" not in out
+    assert "\u2028" not in out
+    assert json.loads(out)["data"]["text"] == text

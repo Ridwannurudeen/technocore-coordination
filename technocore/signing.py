@@ -64,11 +64,17 @@ def _default_seed_file(
     return Path(home) / ".config" / "technocore" / "seed"
 
 
-def _parse_seed_file(path: Path) -> str:
+def _parse_seed_file(path: Path, platform: str) -> str:
     try:
         contents = path.read_text(encoding="utf-8")
+        mode = path.stat().st_mode
     except OSError as exc:
         raise SeedError(f"could not read seed file {path}") from exc
+
+    if platform != "nt" and mode & 0o077:
+        raise SeedError(
+            f"seed file {path} is readable by other users; run chmod 600 on it"
+        )
 
     lines = contents.splitlines()
     if len(lines) != 1 or not lines[0].startswith("export SIGN_SEED="):
@@ -97,7 +103,7 @@ def load_seed(
 
     selected_platform = os.name if platform is None else platform
     path = seed_file or _default_seed_file(source, selected_platform)
-    return bytes.fromhex(_parse_seed_file(path))
+    return bytes.fromhex(_parse_seed_file(path, selected_platform))
 
 
 def multibase(raw: bytes) -> str:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import queue
 import re
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -25,8 +28,117 @@ DEFAULT_BASE_URL = "https://technocore.chat"
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
 ASCII_NONCE_RE = re.compile(r"[0-9]{1,19}\Z")
 MAX_SAFE_MILLISECOND_NONCE = 9_999_999_999_999
+MAX_REMOTE_NONCE_AHEAD_MS = 5 * 60 * 1000
 SIGNED_NOTE_NAMESPACES = frozenset({"room-owners", "room-allow"})
 MAX_GET_URL_LENGTH = 16_000
+REQUEST_TIMEOUT_SECONDS = 30.0
+MAX_RETRY_SECONDS = 60.0
+MAX_RESPONSE_BYTES = 8_388_608
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse 3xx: following one would hand the signed URL to another host."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def _open(request: urllib.request.Request, timeout: float) -> Any:
+    return _OPENER.open(request, timeout=timeout)
+
+
+def _set_response_timeout(response: Any, timeout: float) -> None:
+    target = response
+    for _ in range(3):
+        fp = getattr(target, "fp", None)
+        if fp is None:
+            return
+        raw = getattr(fp, "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if sock is not None:
+            sock.settimeout(timeout)
+            return
+        target = fp
+
+
+def _read_before_deadline(response: Any, limit: int, deadline: float) -> bytes:
+    read1 = getattr(response, "read1", None)
+    if read1 is None:
+        return response.read(limit)
+
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("network request deadline exceeded")
+        _set_response_timeout(response, remaining)
+        chunk = read1(min(65_536, limit - total))
+        if time.monotonic() > deadline:
+            raise TimeoutError("network request deadline exceeded")
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _exchange(
+    request: urllib.request.Request,
+    timeout: float,
+) -> tuple[int | None, Any, bytes, int | None]:
+    deadline = time.monotonic() + timeout
+    outcomes: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("network request deadline exceeded")
+            try:
+                response = _open(request, timeout=remaining)
+            except urllib.error.HTTPError as exc:
+                with exc:
+                    raw = _read_before_deadline(
+                        exc,
+                        MAX_RESPONSE_BYTES,
+                        deadline,
+                    )
+                outcome = (exc.code, exc.headers, raw, None)
+            else:
+                with response:
+                    raw = _read_before_deadline(
+                        response,
+                        MAX_RESPONSE_BYTES + 1,
+                        deadline,
+                    )
+                    response_remaining = response.length
+                outcome = (None, None, raw, response_remaining)
+        except Exception as exc:
+            outcomes.put((False, exc))
+        else:
+            outcomes.put((True, outcome))
+
+    threading.Thread(target=run, name="technocore-http", daemon=True).start()
+    remaining = max(0.0, deadline - time.monotonic())
+    try:
+        succeeded, payload = outcomes.get(timeout=remaining)
+    except queue.Empty:
+        raise TimeoutError("network request deadline exceeded") from None
+    if not succeeded:
+        raise payload
+    return payload
 
 
 class ClientError(Exception):
@@ -50,7 +162,7 @@ class NonceResolutionError(ClientError):
 
 
 def _untrusted_body(body: str) -> str:
-    return "[UNTRUSTED service data] " + json.dumps(body, ensure_ascii=False)
+    return "[UNTRUSTED service data] " + json.dumps(body, ensure_ascii=True)
 
 
 class HTTPStatusError(ClientError):
@@ -140,21 +252,21 @@ class Client:
         body: str,
         retry_after_header: str | None,
     ) -> float | None:
+        if retry_after_header is not None:
+            try:
+                seconds = float(retry_after_header)
+            except ValueError:
+                seconds = None
+            if seconds is not None and seconds >= 0:
+                return min(seconds, MAX_RETRY_SECONDS)
+
         match = re.search(
             r"(?i)(?:retry(?:-after)?|try\s+again|wait)"
             r"(?:\s+in)?[^0-9]{0,32}([0-9]+(?:\.[0-9]+)?)",
             body,
         )
         if match:
-            return float(match.group(1))
-
-        if retry_after_header is not None:
-            try:
-                seconds = float(retry_after_header)
-            except ValueError:
-                return None
-            if seconds >= 0:
-                return seconds
+            return min(float(match.group(1)), MAX_RETRY_SECONDS)
         return None
 
     def _request(
@@ -163,6 +275,7 @@ class Client:
         *,
         query: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> str:
         url = self.base_url + path
         if query:
@@ -188,26 +301,10 @@ class Client:
                 method=method,
             )
             try:
-                with urllib.request.urlopen(request) as response:
-                    raw = response.read()
-            except urllib.error.HTTPError as exc:
-                raw_error = exc.read()
-                body = raw_error.decode("utf-8", errors="replace")
-                if exc.code == 409:
-                    raise ConflictError(exc.code, body) from None
-                if exc.code == 429:
-                    retry_after = self._retry_seconds(
-                        body,
-                        exc.headers.get("Retry-After"),
-                    )
-                    if (
-                        retry_after is None
-                        or attempt == self.max_rate_limit_retries
-                    ):
-                        raise RateLimitError(body, retry_after) from None
-                    time.sleep(retry_after)
-                    continue
-                raise HTTPStatusError(exc.code, body) from None
+                status, response_headers, raw, remaining = _exchange(
+                    request,
+                    timeout,
+                )
             except urllib.error.URLError as exc:
                 raise NetworkError(
                     f"network request failed ({type(exc.reason).__name__})"
@@ -216,6 +313,33 @@ class Client:
                 raise NetworkError(
                     f"network request failed ({type(exc).__name__})"
                 ) from None
+            except http.client.HTTPException as exc:
+                raise ProtocolError(
+                    f"service response is malformed ({type(exc).__name__})"
+                ) from None
+
+            if status is not None:
+                body = raw.decode("utf-8", errors="replace")
+                if status == 409:
+                    raise ConflictError(status, body) from None
+                if status == 429:
+                    retry_after = self._retry_seconds(
+                        body,
+                        response_headers.get("Retry-After"),
+                    )
+                    if (
+                        retry_after is None
+                        or attempt == self.max_rate_limit_retries
+                    ):
+                        raise RateLimitError(body, retry_after) from None
+                    time.sleep(retry_after)
+                    continue
+                raise HTTPStatusError(status, body) from None
+
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise ProtocolError("service response exceeds the 8 MiB cap")
+            if remaining:
+                raise ProtocolError("service response was truncated")
 
             try:
                 return raw.decode("utf-8")
@@ -229,11 +353,12 @@ class Client:
         path: str,
         *,
         query: dict[str, str] | None = None,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> Any:
-        body = self._request(path, query=query)
+        body = self._request(path, query=query, timeout=timeout)
         try:
             return json.loads(body)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             raise ProtocolError("service response is not valid JSON") from None
 
     def read_room(
@@ -253,7 +378,11 @@ class Client:
             poll_counter=poll_counter,
             json_format=False,
         )
-        return self._request(f"/r/{self._segment(room)}", query=query)
+        return self._request(
+            f"/r/{self._segment(room)}",
+            query=query,
+            timeout=REQUEST_TIMEOUT_SECONDS + (wait or 0),
+        )
 
     def read_room_json(
         self,
@@ -272,7 +401,11 @@ class Client:
             poll_counter=poll_counter,
             json_format=True,
         )
-        return self._request_json(f"/r/{self._segment(room)}", query=query)
+        return self._request_json(
+            f"/r/{self._segment(room)}",
+            query=query,
+            timeout=REQUEST_TIMEOUT_SECONDS + (wait or 0),
+        )
 
     def _room_query(
         self,
@@ -306,10 +439,16 @@ class Client:
 
     def _highest_room_nonce(self, payload: Any, did: str) -> int:
         highest = 0
+        max_remote_nonce = min(
+            int(time.time() * 1000) + MAX_REMOTE_NONCE_AHEAD_MS,
+            MAX_SAFE_MILLISECOND_NONCE - 1,
+        )
         for message in room_messages(payload):
             if message.get("from") != did:
                 continue
             nonce = message.get("nonce")
+            if nonce is None:
+                continue
             if isinstance(nonce, bool):
                 raise NonceResolutionError(
                     "an existing message from this DID has a malformed nonce"
@@ -320,11 +459,8 @@ class Client:
                     "an existing message from this DID has a malformed nonce"
                 )
             numeric_nonce = int(nonce_text)
-            if numeric_nonce > MAX_SAFE_MILLISECOND_NONCE:
-                raise NonceResolutionError(
-                    "the room contains a nonce above the safe millisecond range; "
-                    "refusing to perpetuate it"
-                )
+            if numeric_nonce > max_remote_nonce:
+                continue
             highest = max(highest, numeric_nonce)
         return highest
 
@@ -367,21 +503,19 @@ class Client:
                 f"{nonce_text}/{self._segment(signed_text)}"
             )
 
-            if len(self.base_url + path) <= MAX_GET_URL_LENGTH:
-                response = self._request(path)
-            else:
-                response = self._request(
-                    f"/r/{self._segment(room)}",
-                    json_body={
-                        "did": identity.did,
-                        "sig": encoded_signature,
-                        "nonce": nonce_text,
-                        "text": signed_text,
-                    },
-                )
-
             self._store_nonce(identity.did, scope, nonce)
-            return response
+
+            if len(self.base_url + path) <= MAX_GET_URL_LENGTH:
+                return self._request(path)
+            return self._request(
+                f"/r/{self._segment(room)}",
+                json_body={
+                    "did": identity.did,
+                    "sig": encoded_signature,
+                    "nonce": nonce_text,
+                    "text": signed_text,
+                },
+            )
 
     def note_get(self, namespace: str, key: str) -> str:
         validate_name("namespace", namespace)
@@ -406,6 +540,8 @@ class Client:
             raise ValidationError("expected and if_absent are mutually exclusive")
 
         cleaned = self._clean(value, MAX_VALUE_CHARS)
+        if expected is not None:
+            expected = self._clean(expected, MAX_VALUE_CHARS)
 
         signed = namespace in SIGNED_NOTE_NAMESPACES
         if signed:
@@ -473,9 +609,29 @@ class Client:
                 f"{self._segment(encoded_signature)}/{nonce_text}/"
                 f"{self._segment(signed_value)}"
             )
-            response = self._request(path, query=query)
+            full_url = self.base_url + path
+            if query:
+                full_url += "?" + urllib.parse.urlencode(query)
+
             self._store_nonce(identity.did, scope, nonce)
-            return response
+
+            if len(full_url) <= MAX_GET_URL_LENGTH:
+                return self._request(path, query=query)
+
+            body: dict[str, Any] = {
+                "did": identity.did,
+                "sig": encoded_signature,
+                "nonce": nonce_text,
+                "value": signed_value,
+            }
+            if expected is not None:
+                body["if"] = expected
+            elif if_absent:
+                body["if_absent"] = True
+            return self._request(
+                f"/kv/{self._segment(namespace)}/{self._segment(key)}",
+                json_body=body,
+            )
 
     def _room_note_nonce(self, room: str) -> int:
         try:
@@ -558,11 +714,14 @@ class Client:
             payload = json.loads(raw)
         except (OSError, json.JSONDecodeError) as exc:
             raise NonceResolutionError(
-                "the local nonce cache is unreadable or malformed"
+                f"the local nonce cache {self.nonce_cache_path} is unreadable "
+                "or malformed"
             ) from exc
 
         if not isinstance(payload, dict):
-            raise NonceResolutionError("the local nonce cache is malformed")
+            raise NonceResolutionError(
+                f"the local nonce cache {self.nonce_cache_path} is malformed"
+            )
 
         cache: dict[str, int] = {}
         for key, value in payload.items():
@@ -573,7 +732,9 @@ class Client:
                 or value < 0
                 or value > MAX_SAFE_MILLISECOND_NONCE
             ):
-                raise NonceResolutionError("the local nonce cache is malformed")
+                raise NonceResolutionError(
+                    f"the local nonce cache {self.nonce_cache_path} is malformed"
+                )
             cache[key] = value
         return cache
 
@@ -608,7 +769,7 @@ class Client:
                 except OSError:
                     pass
             raise NonceResolutionError(
-                "could not persist the local nonce cache"
+                f"could not persist the local nonce cache {self.nonce_cache_path}"
             ) from exc
 
     @contextmanager
@@ -622,20 +783,25 @@ class Client:
             ) from exc
 
         try:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
+            try:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
 
-            if os.name == "nt":
-                import msvcrt
+                if os.name == "nt":
+                    import msvcrt
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                raise NonceResolutionError(
+                    "could not acquire the local nonce lock"
+                ) from exc
 
             try:
                 yield
@@ -649,10 +815,6 @@ class Client:
                     import fcntl
 
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError as exc:
-            raise NonceResolutionError(
-                "could not acquire the local nonce lock"
-            ) from exc
         finally:
             handle.close()
 

@@ -1,3 +1,4 @@
+import os
 import re
 
 import pytest
@@ -5,9 +6,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from technocore.signing import (
     Identity,
+    SeedError,
     SigningError,
     canonical_message,
     canonical_note,
+    load_seed,
     swept,
 )
 
@@ -71,3 +74,27 @@ def test_did_fingerprint_and_signature_shape():
     assert len(encoded_signature) == 86
     assert re.fullmatch(r"[A-Za-z0-9_-]{86}", encoded_signature)
     assert "=" not in encoded_signature
+
+
+def test_group_readable_seed_file_is_refused(tmp_path):
+    seed_file = tmp_path / "seed"
+    seed_file.write_text(
+        f"export SIGN_SEED={RFC8032_SEED.hex()}\n",
+        encoding="utf-8",
+    )
+    seed_file.chmod(0o644)
+
+    with pytest.raises(SeedError, match="readable by other users"):
+        load_seed(environ={}, seed_file=seed_file, platform="posix")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file permissions only")
+def test_owner_only_seed_file_is_accepted(tmp_path):
+    seed_file = tmp_path / "seed"
+    seed_file.write_text(
+        f"export SIGN_SEED={RFC8032_SEED.hex()}\n",
+        encoding="utf-8",
+    )
+    seed_file.chmod(0o600)
+
+    assert load_seed(environ={}, seed_file=seed_file) == RFC8032_SEED
