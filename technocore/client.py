@@ -271,7 +271,7 @@ class Client:
         body = self._request(path, query=query, timeout=timeout)
         try:
             return json.loads(body)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             raise ProtocolError("service response is not valid JSON") from None
 
     def read_room(

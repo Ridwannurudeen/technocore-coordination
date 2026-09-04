@@ -431,6 +431,22 @@ def test_socket_timeout_becomes_a_network_error(tmp_path, monkeypatch):
         client.note_get("status", "worker")
 
 
+def test_deeply_nested_json_becomes_a_protocol_error(tmp_path, monkeypatch):
+    body = ("[" * 100_000 + "0" + "]" * 100_000).encode("ascii")
+
+    def fake_open(request, timeout):
+        return FakeResponse(body)
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    client = Client(
+        "https://example.invalid",
+        nonce_cache_path=tmp_path / "nonces.json",
+    )
+
+    with pytest.raises(ProtocolError, match="not valid JSON"):
+        client.read_room_json("lobby")
+
+
 def test_redirects_are_not_followed_by_the_real_opener(tmp_path):
     requested = []
 
