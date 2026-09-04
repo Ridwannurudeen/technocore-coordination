@@ -3,8 +3,10 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import queue
 import re
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -53,6 +55,89 @@ _OPENER = urllib.request.build_opener(_NoRedirect())
 
 def _open(request: urllib.request.Request, timeout: float) -> Any:
     return _OPENER.open(request, timeout=timeout)
+
+
+def _set_response_timeout(response: Any, timeout: float) -> None:
+    target = response
+    for _ in range(3):
+        fp = getattr(target, "fp", None)
+        if fp is None:
+            return
+        raw = getattr(fp, "raw", None)
+        sock = getattr(raw, "_sock", None)
+        if sock is not None:
+            sock.settimeout(timeout)
+            return
+        target = fp
+
+
+def _read_before_deadline(response: Any, limit: int, deadline: float) -> bytes:
+    read1 = getattr(response, "read1", None)
+    if read1 is None:
+        return response.read(limit)
+
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("network request deadline exceeded")
+        _set_response_timeout(response, remaining)
+        chunk = read1(min(65_536, limit - total))
+        if time.monotonic() > deadline:
+            raise TimeoutError("network request deadline exceeded")
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _exchange(
+    request: urllib.request.Request,
+    timeout: float,
+) -> tuple[int | None, Any, bytes, int | None]:
+    deadline = time.monotonic() + timeout
+    outcomes: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("network request deadline exceeded")
+            try:
+                response = _open(request, timeout=remaining)
+            except urllib.error.HTTPError as exc:
+                with exc:
+                    raw = _read_before_deadline(
+                        exc,
+                        MAX_RESPONSE_BYTES,
+                        deadline,
+                    )
+                outcome = (exc.code, exc.headers, raw, None)
+            else:
+                with response:
+                    raw = _read_before_deadline(
+                        response,
+                        MAX_RESPONSE_BYTES + 1,
+                        deadline,
+                    )
+                    response_remaining = response.length
+                outcome = (None, None, raw, response_remaining)
+        except Exception as exc:
+            outcomes.put((False, exc))
+        else:
+            outcomes.put((True, outcome))
+
+    threading.Thread(target=run, name="technocore-http", daemon=True).start()
+    remaining = max(0.0, deadline - time.monotonic())
+    try:
+        succeeded, payload = outcomes.get(timeout=remaining)
+    except queue.Empty:
+        raise TimeoutError("network request deadline exceeded") from None
+    if not succeeded:
+        raise payload
+    return payload
 
 
 class ClientError(Exception):
@@ -215,27 +300,10 @@ class Client:
                 method=method,
             )
             try:
-                with _open(request, timeout=timeout) as response:
-                    raw = response.read(MAX_RESPONSE_BYTES + 1)
-                    remaining = response.length
-            except urllib.error.HTTPError as exc:
-                raw_error = exc.read(MAX_RESPONSE_BYTES)
-                body = raw_error.decode("utf-8", errors="replace")
-                if exc.code == 409:
-                    raise ConflictError(exc.code, body) from None
-                if exc.code == 429:
-                    retry_after = self._retry_seconds(
-                        body,
-                        exc.headers.get("Retry-After"),
-                    )
-                    if (
-                        retry_after is None
-                        or attempt == self.max_rate_limit_retries
-                    ):
-                        raise RateLimitError(body, retry_after) from None
-                    time.sleep(retry_after)
-                    continue
-                raise HTTPStatusError(exc.code, body) from None
+                status, response_headers, raw, remaining = _exchange(
+                    request,
+                    timeout,
+                )
             except urllib.error.URLError as exc:
                 raise NetworkError(
                     f"network request failed ({type(exc.reason).__name__})"
@@ -248,6 +316,24 @@ class Client:
                 raise ProtocolError(
                     f"service response is malformed ({type(exc).__name__})"
                 ) from None
+
+            if status is not None:
+                body = raw.decode("utf-8", errors="replace")
+                if status == 409:
+                    raise ConflictError(status, body) from None
+                if status == 429:
+                    retry_after = self._retry_seconds(
+                        body,
+                        response_headers.get("Retry-After"),
+                    )
+                    if (
+                        retry_after is None
+                        or attempt == self.max_rate_limit_retries
+                    ):
+                        raise RateLimitError(body, retry_after) from None
+                    time.sleep(retry_after)
+                    continue
+                raise HTTPStatusError(status, body) from None
 
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise ProtocolError("service response exceeds the 8 MiB cap")

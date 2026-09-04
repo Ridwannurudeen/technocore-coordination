@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import threading
+import time
 import urllib.error
 import urllib.parse
 from pathlib import Path
@@ -429,6 +430,43 @@ def test_socket_timeout_becomes_a_network_error(tmp_path, monkeypatch):
 
     with pytest.raises(NetworkError, match="TimeoutError"):
         client.note_get("status", "worker")
+
+
+def test_total_deadline_stops_a_trickling_response(tmp_path):
+    body = b"0123456789"
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                for byte in body:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, format, *args):
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = Client(
+            f"http://127.0.0.1:{server.server_port}",
+            nonce_cache_path=tmp_path / "nonces.json",
+        )
+        started = time.monotonic()
+        with pytest.raises(NetworkError, match="TimeoutError"):
+            client._request("/trickle", timeout=0.2)
+        assert time.monotonic() - started < 0.4
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_deeply_nested_json_becomes_a_protocol_error(tmp_path, monkeypatch):
