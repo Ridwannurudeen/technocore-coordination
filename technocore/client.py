@@ -76,7 +76,7 @@ class NonceResolutionError(ClientError):
 
 
 def _untrusted_body(body: str) -> str:
-    return "[UNTRUSTED service data] " + json.dumps(body, ensure_ascii=False)
+    return "[UNTRUSTED service data] " + json.dumps(body, ensure_ascii=True)
 
 
 class HTTPStatusError(ClientError):

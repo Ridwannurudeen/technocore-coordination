@@ -616,6 +616,30 @@ def test_terminal_escapes_cannot_erase_the_untrusted_label(capsys):
     assert "spoofed" in out
 
 
+def test_http_error_controls_are_escaped_on_stderr(monkeypatch, capsys):
+    body = "\x1b[2K\x9b2Kspoofed".encode("utf-8")
+
+    def fake_open(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            500,
+            "Internal Server Error",
+            {},
+            io.BytesIO(body),
+        )
+
+    monkeypatch.setattr(client_module, "_open", fake_open)
+    monkeypatch.setenv("TECHNOCORE_BASE_URL", "https://example.invalid")
+
+    assert cli.main(["note", "get", "status", "worker"]) == 7
+
+    err = capsys.readouterr().err
+    assert "\x1b" not in err
+    assert "\x9b" not in err
+    assert "[UNTRUSTED service data]" in err
+    assert "\\u001b[2K\\u009b2Kspoofed" in err
+
+
 def test_claim_on_room_owners_signs_and_prints_the_response(capsys):
     signer = object()
 
