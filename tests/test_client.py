@@ -16,7 +16,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from technocore import cli
 from technocore import client as client_module
 from technocore.client import (
-    MAX_SAFE_MILLISECOND_NONCE,
     Client,
     ConflictError,
     HTTPStatusError,
@@ -114,25 +113,51 @@ def test_local_cache_beats_backward_clock(tmp_path, monkeypatch):
     assert posted_nonce(client) == 8001
 
 
-def test_nonce_above_safe_millisecond_range_is_refused(tmp_path):
+def test_hostile_remote_nonce_cannot_block_signed_write(tmp_path, monkeypatch):
     signer = identity()
-    client = StubClient(
-        tmp_path / "nonces.json",
-        [
-            {
-                "from": signer.did,
-                "nonce": str(MAX_SAFE_MILLISECOND_NONCE + 1),
-            }
-        ],
-    )
+    hostile_nonce = 9_999_999_999_999
+    current_ms = 1_700_000_000_000
+    requested = []
 
-    with pytest.raises(
-        NonceResolutionError,
-        match="above the safe millisecond range",
-    ):
-        client.say_signed("lobby", "ready", signer)
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            requested.append(self.path)
+            if self.path.startswith("/r/lobby?"):
+                body = json.dumps(
+                    [{"from": signer.did, "nonce": hostile_nonce}]
+                ).encode("utf-8")
+            else:
+                body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    assert client.requests == []
+        def log_message(self, format, *args):
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setattr(client_module.time, "time", lambda: current_ms / 1000)
+        cache_path = tmp_path / "nonces.json"
+        client = Client(
+            f"http://127.0.0.1:{server.server_port}",
+            nonce_cache_path=cache_path,
+        )
+
+        assert client.say_signed("lobby", "ready", signer) == "ok"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    signed_path = urllib.parse.urlparse(requested[-1]).path
+    written_nonce = int(signed_path.split("/")[-2])
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert written_nonce == current_ms
+    assert cache[f"{signer.did}|room:lobby"] == current_ms
 
 
 def test_unreadable_room_refuses_write(tmp_path):

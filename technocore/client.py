@@ -28,6 +28,7 @@ DEFAULT_BASE_URL = "https://technocore.chat"
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
 ASCII_NONCE_RE = re.compile(r"[0-9]{1,19}\Z")
 MAX_SAFE_MILLISECOND_NONCE = 9_999_999_999_999
+MAX_REMOTE_NONCE_AHEAD_MS = 5 * 60 * 1000
 SIGNED_NOTE_NAMESPACES = frozenset({"room-owners", "room-allow"})
 MAX_GET_URL_LENGTH = 16_000
 REQUEST_TIMEOUT_SECONDS = 30.0
@@ -438,6 +439,10 @@ class Client:
 
     def _highest_room_nonce(self, payload: Any, did: str) -> int:
         highest = 0
+        max_remote_nonce = min(
+            int(time.time() * 1000) + MAX_REMOTE_NONCE_AHEAD_MS,
+            MAX_SAFE_MILLISECOND_NONCE - 1,
+        )
         for message in room_messages(payload):
             if message.get("from") != did:
                 continue
@@ -454,11 +459,8 @@ class Client:
                     "an existing message from this DID has a malformed nonce"
                 )
             numeric_nonce = int(nonce_text)
-            if numeric_nonce > MAX_SAFE_MILLISECOND_NONCE:
-                raise NonceResolutionError(
-                    "the room contains a nonce above the safe millisecond range; "
-                    "refusing to perpetuate it"
-                )
+            if numeric_nonce > max_remote_nonce:
+                continue
             highest = max(highest, numeric_nonce)
         return highest
 
