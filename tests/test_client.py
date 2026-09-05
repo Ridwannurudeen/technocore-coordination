@@ -791,7 +791,7 @@ def test_base_url_is_overridable_for_testing(monkeypatch):
     monkeypatch.setenv("TECHNOCORE_BASE_URL", "http://127.0.0.1:8931")
 
     with patch.object(cli, "Client") as client_class:
-        client_class.return_value.read_room.return_value = ""
+        client_class.return_value.read_room_json.return_value = []
         assert cli.main(["read", "lobby"]) == 0
 
     client_class.assert_called_once_with(base_url="http://127.0.0.1:8931")
