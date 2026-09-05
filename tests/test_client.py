@@ -25,7 +25,13 @@ from technocore.client import (
     ValidationError,
     validate_name,
 )
-from technocore.signing import Identity, SeedError
+from technocore.signing import (
+    Identity,
+    SeedError,
+    canonical_message,
+    did_of,
+    signature,
+)
 
 SEED_HEX = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
 
@@ -86,9 +92,17 @@ def test_remote_floor_beats_stale_local_cache_and_uses_fresh_max_window(
         json.dumps({f"{signer.did}|room:lobby": 1000}),
         encoding="utf-8",
     )
+    text, encoded_signature = signer.sign_message("lobby", "5000", "previous")
     client = StubClient(
         cache_path,
-        [{"from": signer.did, "nonce": "5000"}],
+        [
+            {
+                "from": signer.did,
+                "nonce": "5000",
+                "text": text,
+                "sig": encoded_signature,
+            }
+        ],
     )
     monkeypatch.setattr(client_module.time, "time", lambda: 1.0)
     monkeypatch.setattr(client_module.time, "time_ns", lambda: 123456789)
@@ -158,6 +172,29 @@ def test_hostile_remote_nonce_cannot_block_signed_write(tmp_path, monkeypatch):
     cache = json.loads(cache_path.read_text(encoding="utf-8"))
     assert written_nonce == current_ms
     assert cache[f"{signer.did}|room:lobby"] == current_ms
+
+
+def test_highest_room_nonce_ignores_bad_signature_with_huge_nonce(
+    tmp_path,
+    monkeypatch,
+):
+    room = "lobby"
+    nonce = 1_700_000_000_100
+    claimed_key = Ed25519PrivateKey.generate()
+    signing_key = Ed25519PrivateKey.generate()
+    message = {
+        "from": did_of(claimed_key),
+        "nonce": nonce,
+        "text": "forged",
+        "sig": signature(
+            signing_key,
+            canonical_message(room, str(nonce), "forged"),
+        ),
+    }
+    client = StubClient(tmp_path / "nonces.json")
+    monkeypatch.setattr(client_module.time, "time", lambda: 1_700_000_000.0)
+
+    assert client._highest_room_nonce(room, [message], message["from"]) == 0
 
 
 def test_unreadable_room_refuses_write(tmp_path):
@@ -553,11 +590,18 @@ def test_redirects_are_not_followed_by_the_real_opener(tmp_path):
 def test_unsigned_messages_without_a_nonce_do_not_block_the_floor(tmp_path):
     signer = identity()
     client = StubClient(tmp_path / "nonces.json")
+    text, encoded_signature = signer.sign_message("lobby", "5", "signed")
 
     highest = client._highest_room_nonce(
+        "lobby",
         [
             {"from": signer.did, "text": "posted through the nick route"},
-            {"from": signer.did, "nonce": 5},
+            {
+                "from": signer.did,
+                "nonce": 5,
+                "text": text,
+                "sig": encoded_signature,
+            },
         ],
         signer.did,
     )

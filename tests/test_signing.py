@@ -4,19 +4,37 @@ import re
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from technocore import signing
 from technocore.signing import (
     Identity,
     SeedError,
     SigningError,
     canonical_message,
     canonical_note,
+    did_of,
     load_seed,
+    signature,
     swept,
 )
 
 RFC8032_SEED = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
 EXPECTED_DID = "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
 EXPECTED_FINGERPRINT = "0658808e85cc8317"
+
+
+def signed_message(
+    room="lobby",
+    nonce=1700000000000,
+    text="ready",
+):
+    key = Ed25519PrivateKey.generate()
+    message = {
+        "from": did_of(key),
+        "nonce": nonce,
+        "text": text,
+        "sig": signature(key, canonical_message(room, str(nonce), text)),
+    }
+    return key, message
 
 
 @pytest.mark.parametrize(
@@ -74,6 +92,69 @@ def test_did_fingerprint_and_signature_shape():
     assert len(encoded_signature) == 86
     assert re.fullmatch(r"[A-Za-z0-9_-]{86}", encoded_signature)
     assert "=" not in encoded_signature
+
+
+def test_correctly_signed_message_verifies():
+    _, message = signed_message()
+
+    assert signing.verify_message("lobby", message)
+
+
+def test_changed_message_text_does_not_verify():
+    _, message = signed_message(text="ready")
+    message["text"] = "reads"
+
+    assert not signing.verify_message("lobby", message)
+
+
+def test_signature_from_a_different_key_does_not_verify():
+    _, message = signed_message()
+    other_key = Ed25519PrivateKey.generate()
+    message["sig"] = signature(
+        other_key,
+        canonical_message("lobby", str(message["nonce"]), message["text"]),
+    )
+
+    assert not signing.verify_message("lobby", message)
+
+
+@pytest.mark.parametrize(
+    "bad_signature",
+    [None, "", "a" * 85, "!" * 86],
+    ids=["missing", "empty", "wrong-length", "non-base64url"],
+)
+def test_malformed_signatures_do_not_verify_or_raise(bad_signature):
+    _, message = signed_message()
+    if bad_signature is None:
+        del message["sig"]
+    else:
+        message["sig"] = bad_signature
+
+    assert not signing.verify_message("lobby", message)
+
+
+def test_undecodable_sender_did_does_not_verify_or_raise():
+    _, message = signed_message()
+    message["from"] = "did:key:znot-a-valid-ed25519-key"
+
+    assert not signing.verify_message("lobby", message)
+
+
+def test_verification_resweeps_the_stored_text_idempotently():
+    room = "lobby"
+    nonce = 1700000000000
+    raw_text = "\u202eready\nnow\u200d"
+    stored_text = swept(raw_text, 4096)
+    key = Ed25519PrivateKey.generate()
+    message = {
+        "from": did_of(key),
+        "nonce": nonce,
+        "text": stored_text,
+        "sig": signature(key, canonical_message(room, str(nonce), raw_text)),
+    }
+
+    assert swept(stored_text, 4096) == stored_text
+    assert signing.verify_message(room, message)
 
 
 def test_group_readable_seed_file_is_refused(tmp_path):

@@ -22,6 +22,7 @@ from .signing import (
     Identity,
     SigningError,
     swept,
+    verify_message,
 )
 
 DEFAULT_BASE_URL = "https://technocore.chat"
@@ -437,7 +438,7 @@ class Client:
             query["format"] = "json"
         return query
 
-    def _highest_room_nonce(self, payload: Any, did: str) -> int:
+    def _highest_room_nonce(self, room: str, payload: Any, did: str) -> int:
         highest = 0
         max_remote_nonce = min(
             int(time.time() * 1000) + MAX_REMOTE_NONCE_AHEAD_MS,
@@ -445,6 +446,8 @@ class Client:
         )
         for message in room_messages(payload):
             if message.get("from") != did:
+                continue
+            if not verify_message(room, message):
                 continue
             nonce = message.get("nonce")
             if nonce is None:
@@ -480,7 +483,11 @@ class Client:
                     limit=200,
                     poll_counter=time.time_ns(),
                 )
-                remote_floor = self._highest_room_nonce(payload, identity.did)
+                remote_floor = self._highest_room_nonce(
+                    room,
+                    payload,
+                    identity.did,
+                )
             except NonceResolutionError:
                 raise
             except ClientError as exc:

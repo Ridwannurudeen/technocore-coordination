@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import os
 import re
@@ -8,7 +9,11 @@ import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 MULTICODEC_ED25519 = b"\xed\x01"
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -17,6 +22,7 @@ MAX_TEXT_CHARS = 4096
 MAX_VALUE_CHARS = 8192
 NONCE_RE = re.compile(r"[0-9]{1,19}\Z")
 SEED_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
+SIGNATURE_RE = re.compile(r"[A-Za-z0-9_-]{86}\Z")
 
 
 class SigningError(Exception):
@@ -149,6 +155,61 @@ def signature(key: Ed25519PrivateKey, message: str) -> str:
     if len(encoded) != 86:
         raise SigningError(f"internal: bad signature length {len(encoded)}")
     return encoded
+
+
+def _public_key_from_did(did: str) -> Ed25519PublicKey:
+    prefix = "did:key:z"
+    if len(did) != 56 or not did.startswith(prefix):
+        raise SigningError("DID is not an Ed25519 did:key")
+
+    number = 0
+    for char in did[len(prefix) :]:
+        digit = B58.find(char)
+        if digit < 0:
+            raise SigningError("DID contains invalid base58")
+        number = number * 58 + digit
+
+    encoded = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    if len(encoded) != 34 or not encoded.startswith(MULTICODEC_ED25519):
+        raise SigningError("DID does not contain an Ed25519 public key")
+    try:
+        return Ed25519PublicKey.from_public_bytes(encoded[2:])
+    except ValueError as exc:
+        raise SigningError("DID contains an invalid Ed25519 public key") from exc
+
+
+def verify_message(room: str, message: Mapping[str, object]) -> bool:
+    if not isinstance(room, str) or not isinstance(message, Mapping):
+        return False
+
+    did = message.get("from")
+    nonce = message.get("nonce")
+    text = message.get("text")
+    encoded_signature = message.get("sig")
+    if (
+        not isinstance(did, str)
+        or isinstance(nonce, bool)
+        or not isinstance(nonce, (int, str))
+        or not isinstance(text, str)
+        or not isinstance(encoded_signature, str)
+        or not SIGNATURE_RE.fullmatch(encoded_signature)
+    ):
+        return False
+
+    try:
+        raw_signature = base64.b64decode(
+            encoded_signature + "==",
+            altchars=b"-_",
+            validate=True,
+        )
+        if len(raw_signature) != 64:
+            return False
+        public_key = _public_key_from_did(did)
+        canonical = canonical_message(room, str(nonce), text).encode("utf-8")
+        public_key.verify(raw_signature, canonical)
+    except (binascii.Error, InvalidSignature, SigningError, UnicodeError, ValueError):
+        return False
+    return True
 
 
 class Identity:
