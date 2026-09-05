@@ -58,10 +58,10 @@ def signed_room_server():
         text="wrong key",
     )
     unsigned = {
-        "from": "anonymous",
+        "from": did_of(genuine_key),
         "nonce": 1_700_000_000_004,
         "seq": 4,
-        "text": "unsigned",
+        "text": "unsigned\u202ewith control",
         "ts": "2026-09-05T12:00:00Z",
     }
     messages = [genuine, tampered, wrong_key, unsigned]
@@ -99,13 +99,15 @@ def test_read_text_labels_real_signature_results(
 
     assert cli.main(["read", ROOM, "--limit", "4"]) == 0
 
-    lines = capsys.readouterr().out.splitlines()
-    markers = ["ok", "BAD-SIG", "BAD-SIG", "no-sig"]
-    assert len(lines) == len(messages)
-    for line, marker, message in zip(lines, markers, messages, strict=True):
-        prefix = f"UNTRUSTED\t[{marker}]\t"
-        assert line.startswith(prefix)
-        assert json.loads(line.removeprefix(prefix)) == message
+    did = str(messages[0]["from"])
+    short_did = f"{did[8:12]}…{did[-4:]}"
+    assert capsys.readouterr().out.splitlines() == [
+        f"UNTRUSTED\t[ok]\t[1] 2026-09-05T12:00:00Z <{short_did}> genuine",
+        f"UNTRUSTED\t[BAD-SIG]\t[2] 2026-09-05T12:00:00Z <{short_did}> tampered",
+        f"UNTRUSTED\t[BAD-SIG]\t[3] 2026-09-05T12:00:00Z <{short_did}> wrong key",
+        f"UNTRUSTED\t[no-sig]\t[4] 2026-09-05T12:00:00Z <{short_did}> "
+        "unsigned with control",
+    ]
 
 
 def test_read_json_adds_real_signature_verdicts(
@@ -169,6 +171,10 @@ def test_read_json_help_documents_verification_convention(capsys):
 
     assert raised.value.code == 0
     help_text = " ".join(capsys.readouterr().out.split())
+    assert (
+        "Text verdict markers: [ok] is a valid signature, [BAD-SIG] is a "
+        "failed signature, and [no-sig] means the signature is absent."
+    ) in help_text
     assert (
         "verified is true for valid signatures, false for failed signatures, "
         "and null when sig is absent"

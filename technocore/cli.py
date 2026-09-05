@@ -45,7 +45,14 @@ def _parser() -> argparse.ArgumentParser:
         help="print the DID and fingerprint derived from the signing seed",
     )
 
-    read = commands.add_parser("read", help="read a room")
+    read = commands.add_parser(
+        "read",
+        help="read a room",
+        description=(
+            "Text verdict markers: [ok] is a valid signature, [BAD-SIG] is a "
+            "failed signature, and [no-sig] means the signature is absent."
+        ),
+    )
     read.add_argument("room")
     read.add_argument("--since", type=int)
     read.add_argument("--wait", type=int)
@@ -150,14 +157,29 @@ def _verified_payload(room: str, payload: Any) -> Any:
     return rendered
 
 
+def _short_did(value: Any) -> str:
+    did = str(value).removeprefix("did:key:")
+    if len(did) <= 9:
+        return did
+    return f"{did[:4]}…{did[-4:]}"
+
+
+def _terminal_safe_room_line(message: dict[str, Any]) -> str:
+    rendered = (
+        f"[{message.get('seq')}] {message.get('ts')} "
+        f"<{_short_did(message.get('from', ''))}> {message.get('text', '')}"
+    )
+    return "".join(
+        " " if unicodedata.category(char) in INVISIBLE_CATEGORIES else char
+        for char in rendered
+    )
+
+
 def _print_room_text(room: str, payload: Any) -> None:
     markers = {True: "ok", False: "BAD-SIG", None: "no-sig"}
     for message in room_messages(payload):
         verdict = _verification_verdict(room, message)
-        print(
-            f"UNTRUSTED\t[{markers[verdict]}]\t"
-            f"{_terminal_safe_json(message)}"
-        )
+        print(f"UNTRUSTED\t[{markers[verdict]}]\t{_terminal_safe_room_line(message)}")
 
 
 def _identity_for_note(namespace: str) -> Identity | None:
