@@ -10,10 +10,6 @@ from technocore.signing import canonical_message, did_of, signature
 
 
 ROOM = "lobby"
-VERIFICATION_GAP = pytest.mark.xfail(
-    strict=True,
-    reason="tc read does not yet surface signature verification",
-)
 
 
 def _signed_message(
@@ -93,7 +89,6 @@ def signed_room_server():
         thread.join(timeout=5)
 
 
-@VERIFICATION_GAP
 def test_read_text_labels_real_signature_results(
     signed_room_server,
     monkeypatch,
@@ -113,7 +108,6 @@ def test_read_text_labels_real_signature_results(
         assert json.loads(line.removeprefix(prefix)) == message
 
 
-@VERIFICATION_GAP
 def test_read_json_adds_real_signature_verdicts(
     signed_room_server,
     monkeypatch,
@@ -138,13 +132,44 @@ def test_read_json_adds_real_signature_verdicts(
     ]
 
 
-@VERIFICATION_GAP
+def test_watch_adds_real_signature_verdicts(signed_room_server, capsys):
+    _, messages = signed_room_server
+
+    class StopWatch(Exception):
+        pass
+
+    class OnePollClient:
+        def __init__(self):
+            self.polls = 0
+
+        def read_room_json(self, room, **kwargs):
+            self.polls += 1
+            if self.polls == 1:
+                return messages
+            raise StopWatch
+
+    with pytest.raises(StopWatch):
+        cli._watch(OnePollClient(), ROOM, None)
+
+    output = [json.loads(line)["data"] for line in capsys.readouterr().out.splitlines()]
+    assert [message["text"] for message in output] == [
+        message["text"] for message in messages
+    ]
+    assert [message["verified"] for message in output] == [
+        True,
+        False,
+        False,
+        None,
+    ]
+
+
 def test_read_json_help_documents_verification_convention(capsys):
     with pytest.raises(SystemExit) as raised:
         cli.main(["read", "--help"])
 
     assert raised.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
     assert (
         "verified is true for valid signatures, false for failed signatures, "
         "and null when sig is absent"
-    ) in capsys.readouterr().out
+    ) in help_text

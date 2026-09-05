@@ -22,7 +22,13 @@ from .client import (
     ValidationError,
     room_messages,
 )
-from .signing import INVISIBLE_CATEGORIES, Identity, SeedError, SigningError
+from .signing import (
+    INVISIBLE_CATEGORIES,
+    Identity,
+    SeedError,
+    SigningError,
+    verify_message,
+)
 
 WATCH_IDLE_SECONDS = 1.0
 
@@ -44,7 +50,15 @@ def _parser() -> argparse.ArgumentParser:
     read.add_argument("--since", type=int)
     read.add_argument("--wait", type=int)
     read.add_argument("--limit", type=int)
-    read.add_argument("--json", action="store_true", dest="as_json")
+    read.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help=(
+            "verified is true for valid signatures, false for failed signatures, "
+            "and null when sig is absent"
+        ),
+    )
 
     say = commands.add_parser("say", help="post a signed room message")
     say.add_argument("room")
@@ -95,20 +109,55 @@ def _print_untrusted_text(value: str) -> None:
         print(f"UNTRUSTED\t{visible}")
 
 
-def _print_untrusted_json(value: Any) -> None:
+def _terminal_safe_json(value: Any) -> str:
     dumped = json.dumps(
-        {"untrusted": True, "data": value},
+        value,
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    print(
-        "".join(
-            json.dumps(char, ensure_ascii=True)[1:-1]
-            if unicodedata.category(char) in INVISIBLE_CATEGORIES
-            else char
-            for char in dumped
-        )
+    return "".join(
+        json.dumps(char, ensure_ascii=True)[1:-1]
+        if unicodedata.category(char) in INVISIBLE_CATEGORIES
+        else char
+        for char in dumped
     )
+
+
+def _print_untrusted_json(value: Any) -> None:
+    print(_terminal_safe_json({"untrusted": True, "data": value}))
+
+
+def _verification_verdict(room: str, message: dict[str, Any]) -> bool | None:
+    if "sig" not in message:
+        return None
+    return verify_message(room, message)
+
+
+def _verified_message(room: str, message: dict[str, Any]) -> dict[str, Any]:
+    rendered = dict(message)
+    rendered["verified"] = _verification_verdict(room, message)
+    return rendered
+
+
+def _verified_payload(room: str, payload: Any) -> Any:
+    messages = [
+        _verified_message(room, message) for message in room_messages(payload)
+    ]
+    if isinstance(payload, list):
+        return messages
+    rendered = dict(payload)
+    rendered["messages"] = messages
+    return rendered
+
+
+def _print_room_text(room: str, payload: Any) -> None:
+    markers = {True: "ok", False: "BAD-SIG", None: "no-sig"}
+    for message in room_messages(payload):
+        verdict = _verification_verdict(room, message)
+        print(
+            f"UNTRUSTED\t[{markers[verdict]}]\t"
+            f"{_terminal_safe_json(message)}"
+        )
 
 
 def _identity_for_note(namespace: str) -> Identity | None:
@@ -140,7 +189,7 @@ def _watch(client: Client, room: str, since: int | None) -> int:
             sequence = message.get("seq")
             if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
                 raise ProtocolError("room JSON contains a message with a malformed seq")
-            _print_untrusted_json(message)
+            _print_untrusted_json(_verified_message(room, message))
             next_cursor = max(next_cursor, sequence)
 
         if next_cursor == cursor:
@@ -159,22 +208,16 @@ def _run(args: argparse.Namespace) -> int:
     client = Client(base_url=os.environ.get("TECHNOCORE_BASE_URL", DEFAULT_BASE_URL))
 
     if args.command == "read":
+        payload = client.read_room_json(
+            args.room,
+            since=args.since,
+            wait=args.wait,
+            limit=args.limit,
+        )
         if args.as_json:
-            payload = client.read_room_json(
-                args.room,
-                since=args.since,
-                wait=args.wait,
-                limit=args.limit,
-            )
-            _print_untrusted_json(payload)
+            _print_untrusted_json(_verified_payload(args.room, payload))
         else:
-            body = client.read_room(
-                args.room,
-                since=args.since,
-                wait=args.wait,
-                limit=args.limit,
-            )
-            _print_untrusted_text(body)
+            _print_room_text(args.room, payload)
         return 0
 
     if args.command == "say":
